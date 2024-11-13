@@ -3,18 +3,10 @@ from discord.ext import commands
 from discord import ui
 import datetime
 from supabase import create_client, Client
-import os
-from dotenv import load_dotenv
+from config import DISCORD_TOKEN, SUPABASE_URL, SUPABASE_KEY
 
-# Carrega variáveis de ambiente
-load_dotenv()
-
-# Configuração Supabase
-SUPABASE_URL = "https://lgbbodydvwkxogwjnrax.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxnYmJvZHlkdndreG9nd2pucmF4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzE1MzA1MzMsImV4cCI6MjA0NzEwNjUzM30.r3GoWs_bD9fVJRqpD7jprnmRcgq_HnrlUVljDd4owKg"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Configuração do bot
 intents = discord.Intents.all()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -35,7 +27,7 @@ create table registros (
 class PontoButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        # Initialize all buttons as disabled by default
+
         self.entrada_button.disabled = False
         self.pausa_inicio_button.disabled = True
         self.pausa_fim_button.disabled = True
@@ -53,7 +45,6 @@ class PontoButtons(discord.ui.View):
                 .execute()
 
             if not data.data:
-                # No records - only enable entrada and relatório
                 self.entrada_button.disabled = False
                 self.pausa_inicio_button.disabled = True
                 self.pausa_fim_button.disabled = True
@@ -64,14 +55,12 @@ class PontoButtons(discord.ui.View):
             ultimo_registro = data.data[0]
             tipo = ultimo_registro['tipo']
 
-            # Reset all buttons to disabled first
             self.entrada_button.disabled = True
             self.pausa_inicio_button.disabled = True
             self.pausa_fim_button.disabled = True
             self.saida_button.disabled = True
             self.relatorio_button.disabled = False
 
-            # Enable appropriate buttons based on last action
             if tipo == 'entrada':
                 self.pausa_inicio_button.disabled = False
                 self.saida_button.disabled = False
@@ -125,7 +114,7 @@ async def verificar_usuario_ponto(user_id: str) -> bool:
             .execute()
 
         if not data.data:
-            return True  # Permite abrir novo ponto
+            return True
 
         ultimo_registro = data.data[0]
         return ultimo_registro['tipo'] in ['saida', None]
