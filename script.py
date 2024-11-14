@@ -1,7 +1,11 @@
+import io
+import os
 import discord
 from discord.ext import commands
 from discord import ui
+from discord import User, Member
 import datetime
+from realtime.types import Optional
 from supabase import create_client, Client
 from config import DISCORD_TOKEN, SUPABASE_URL, SUPABASE_KEY
 
@@ -11,344 +15,196 @@ intents = discord.Intents.all()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-"""
--- SQL para criar a tabela no Supabase:
-create table registros (
-    id bigint primary key generated always as identity,
-    user_id text not null,
-    user_name text not null,
-    tipo text not null, -- 'entrada', 'saida', 'pausa_inicio', 'pausa_fim'
-    data_hora timestamp with time zone default timezone('utc'::text, now()),
-    observacao text,
-    created_at timestamp with time zone default timezone('utc'::text, now())
-);
-"""
+def converter_data_brasileira_para_iso8601(data_br: str) -> str:
+    try:
+        data = datetime.datetime.strptime(data_br, "%d/%m/%Y")
+        return data.isoformat()
+    except ValueError:
+        return None
+
+# Função para registrar o ponto no Supabase
+async def registrar_entrada(user_id: str, tipo: str, data_hora: str, user_name: str):
+    try:
+        # Inclui user_name na inserção
+        response = supabase.table('registros').insert({
+            'user_id': user_id,
+            'tipo': tipo,
+            'data_hora': data_hora,
+            'user_name': user_name
+        }).execute()
+
+    except Exception as e:
+        print(f"Erro ao registrar no Supabase: {e}")
+
+class RelatorioModal(ui.Modal, title="Gerar Relatório"):
+    data_inicio = ui.TextInput(label="Data de Início (DD/MM/AAAA)", placeholder="01/01/2024")
+    data_fim = ui.TextInput(label="Data de Fim (DD/MM/AAAA)", placeholder="31/12/2024")
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def is_user_manager(self, interaction: discord.Interaction) -> bool:
+        member = interaction.guild.get_member(interaction.user.id)
+        return member is not None and member.guild_permissions.manage_guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data_inicio_iso = converter_data_brasileira_para_iso8601(self.data_inicio.value)
+        data_fim_iso = converter_data_brasileira_para_iso8601(self.data_fim.value)
+
+        if data_inicio_iso and data_fim_iso:
+            if data_inicio_iso > data_fim_iso:
+                await interaction.response.send_message("❌ A data de início não pode ser posterior à data de fim!", ephemeral=True)
+                return
+
+            await self.gerar_relatorio(interaction, data_inicio_iso, data_fim_iso)
+        else:
+            await interaction.response.send_message(
+                "❌ Formato de data inválido! Por favor, use DD/MM/AAAA.", ephemeral=True
+            )
+
+    async def gerar_relatorio(self, interaction: discord.Interaction, data_inicio: str, data_fim: str):
+        user_id = str(interaction.user.id)
+
+        registros = supabase.table('registros')\
+            .select('*')\
+            .eq('user_id', user_id)\
+            .gte('data_hora', data_inicio)\
+            .lte('data_hora', data_fim)\
+            .order('data_hora', desc=True)\
+            .execute()
+
+        if not registros.data:
+            await interaction.response.send_message("❌ Não há registros para o intervalo selecionado.", ephemeral=True)
+            return
+
+        total_horas_trabalhadas = datetime.timedelta()
+        total_pausa = datetime.timedelta()
+
+        ultima_entrada = None
+        ultima_pausa_inicio = None
+
+        for registro in registros.data:
+            tipo = registro['tipo']
+            data_hora = datetime.datetime.fromisoformat(registro['data_hora'])
+
+            if tipo == "entrada":
+                ultima_entrada = data_hora
+            elif tipo == "saida" and ultima_entrada:
+                total_horas_trabalhadas += data_hora - ultima_entrada
+                ultima_entrada = None
+            elif tipo == "pausa_inicio":
+                ultima_pausa_inicio = data_hora
+            elif tipo == "pausa_fim" and ultima_pausa_inicio:
+                total_pausa += data_hora - ultima_pausa_inicio
+                ultima_pausa_inicio = None
+
+        horas_trabalhadas_excluindo_pausa = total_horas_trabalhadas - total_pausa
+
+        horas_trabalhadas_str = str(horas_trabalhadas_excluindo_pausa)
+        pausa_str = str(total_pausa)
+
+        embed = discord.Embed(
+            title="Relatório de Horas Trabalhadas e Pausas",
+            description=f"Relatório do período de {data_inicio} a {data_fim}",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(name="Horas Trabalhadas (sem pausas)", value=horas_trabalhadas_str, inline=False)
+        embed.add_field(name="Total de Pausas", value=pausa_str, inline=False)
+
+        await interaction.response.send_message(embed=embed)
 
 class PontoButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        self.message: Optional[discord.Message] = None
+        self.eventos_trilha = []
+        self.bot = bot
 
-        self.entrada_button.disabled = False
-        self.pausa_inicio_button.disabled = True
-        self.pausa_fim_button.disabled = True
-        self.saida_button.disabled = True
-        self.relatorio_button.disabled = False
+    async def adicionar_evento_trilha(self, evento: str, usuario: User, tipo: str):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        cor_badge = {
+            'entrada': discord.Color.green(),
+            'pausa_inicio': discord.Color.blurple(),
+            'pausa_fim': discord.Color.blurple(),
+            'saida': discord.Color.red(),
+        }.get(tipo, discord.Color.default())
 
-    async def update_button_states(self, user_id: str):
-        """Update button states based on user's current status"""
-        try:
-            data = supabase.table('registros')\
-                .select("*")\
-                .eq('user_id', user_id)\
-                .order('data_hora', desc=True)\
-                .limit(1)\
-                .execute()
+        badge = f"**[{timestamp}]** {evento} - {usuario.name}"
+        self.eventos_trilha.append((badge, cor_badge))
 
-            if not data.data:
-                self.entrada_button.disabled = False
-                self.pausa_inicio_button.disabled = True
-                self.pausa_fim_button.disabled = True
-                self.saida_button.disabled = True
-                self.relatorio_button.disabled = False
-                return
+        trilha_texto = "\n".join([f"{badge}" for badge, _ in self.eventos_trilha])
 
-            ultimo_registro = data.data[0]
-            tipo = ultimo_registro['tipo']
+        if self.message:
+            embed = discord.Embed(
+                title="Histórico de Ponto",
+                description=trilha_texto,
+                color=discord.Color.blue()
+            )
+            embed.set_thumbnail(url=usuario.avatar.url + "?size=128")  # Mantém o avatar
+            await self.message.edit(embed=embed, view=self)
 
-            self.entrada_button.disabled = True
-            self.pausa_inicio_button.disabled = True
-            self.pausa_fim_button.disabled = True
-            self.saida_button.disabled = True
-            self.relatorio_button.disabled = False
-
-            if tipo == 'entrada':
-                self.pausa_inicio_button.disabled = False
-                self.saida_button.disabled = False
-            elif tipo == 'pausa_inicio':
-                self.pausa_fim_button.disabled = False
-            elif tipo == 'pausa_fim':
-                self.pausa_inicio_button.disabled = False
-                self.saida_button.disabled = False
-            elif tipo == 'saida':
-                self.entrada_button.disabled = False
-
-        except Exception as e:
-            print(f"Error updating button states: {e}")
+        # Agora, registre o evento no Supabase, incluindo o nome do usuário
+        await registrar_entrada(str(usuario.id), tipo, timestamp, usuario.name)
 
     @discord.ui.button(label="Registrar Entrada", style=discord.ButtonStyle.green, custom_id="entrada")
     async def entrada_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await registrar_entrada_interaction(interaction)
-        await self.update_button_states(str(interaction.user.id))
-        await interaction.message.edit(view=self)
+        await self.adicionar_evento_trilha("Entrada registrada", interaction.user, 'entrada')
+        await interaction.response.send_message("✅ Entrada registrada!", ephemeral=True)
+        self.entrada_button.disabled = True  # Desabilita o botão de entrada
+        self.pausa_inicio_button.disabled = False  # Habilita o botão de pausa
+        self.saida_button.disabled = False  # Habilita o botão de saída
+        await self.message.edit(view=self)
 
-    @discord.ui.button(label="Iniciar Pausa", style=discord.ButtonStyle.blurple, custom_id="pausa_inicio")
+    @discord.ui.button(label="Iniciar Pausa", style=discord.ButtonStyle.blurple, custom_id="pausa_inicio", disabled=True)
     async def pausa_inicio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await registrar_pausa_inicio_interaction(interaction)
-        await self.update_button_states(str(interaction.user.id))
-        await interaction.message.edit(view=self)
+        await self.adicionar_evento_trilha("Pausa iniciada", interaction.user, 'pausa_inicio')
+        await interaction.response.send_message("✅ Pausa iniciada!", ephemeral=True)
+        self.pausa_inicio_button.disabled = True  # Desabilita o botão de iniciar pausa
+        self.pausa_fim_button.disabled = False  # Habilita o botão de voltar da pausa
+        await self.message.edit(view=self)
 
-    @discord.ui.button(label="Retornar da Pausa", style=discord.ButtonStyle.blurple, custom_id="pausa_fim")
+    @discord.ui.button(label="Retornar da Pausa", style=discord.ButtonStyle.blurple, custom_id="pausa_fim", disabled=True)
     async def pausa_fim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await registrar_pausa_fim_interaction(interaction)
-        await self.update_button_states(str(interaction.user.id))
-        await interaction.message.edit(view=self)
+        await self.adicionar_evento_trilha("Pausa finalizada", interaction.user, 'pausa_fim')
+        await interaction.response.send_message("✅ Pausa finalizada!", ephemeral=True)
+        self.pausa_fim_button.disabled = True  # Desabilita o botão de retornar da pausa
+        self.pausa_inicio_button.disabled = False  # Reabilita o botão de iniciar pausa
+        self.saida_button.disabled = False  # Habilita o botão de saída
+        await self.message.edit(view=self)
 
-    @discord.ui.button(label="Encerrar Expediente", style=discord.ButtonStyle.red, custom_id="saida")
+    @discord.ui.button(label="Encerrar Expediente", style=discord.ButtonStyle.red, custom_id="saida", disabled=True)
     async def saida_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await registrar_saida_interaction(interaction)
-        await self.update_button_states(str(interaction.user.id))
-        await interaction.message.edit(view=self)
+        # Registra a saída
+        await self.adicionar_evento_trilha("Saída registrada", interaction.user, 'saida')
 
-    @discord.ui.button(label="Ver Relatório", style=discord.ButtonStyle.grey, custom_id="relatorio")
+        # Mensagem de confirmação
+        await interaction.response.send_message("✅ Saída registrada! Expediente finalizado.", ephemeral=True)
+
+        # Desabilita todos os botões, exceto o de "Relatório"
+        self.entrada_button.disabled = True
+        self.pausa_inicio_button.disabled = True
+        self.pausa_fim_button.disabled = True
+        self.saida_button.disabled = True
+        self.relatorio_button.disabled = False  # Habilita o botão de relatório
+
+        # Atualiza a mensagem com a nova configuração
+        await self.message.edit(view=self)
+
+    @discord.ui.button(label="Gerar Relatório", style=discord.ButtonStyle.green, custom_id="relatorio", disabled=False)
     async def relatorio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await gerar_relatorio_interaction(interaction)
-
-async def verificar_usuario_ponto(user_id: str) -> bool:
-    """Verifica se o usuário tem um ponto aberto"""
-    try:
-        data = supabase.table('registros')\
-            .select("*")\
-            .eq('user_id', user_id)\
-            .order('data_hora', desc=True)\
-            .limit(1)\
-            .execute()
-
-        if not data.data:
-            return True
-
-        ultimo_registro = data.data[0]
-        return ultimo_registro['tipo'] in ['saida', None]
-    except Exception as e:
-        print(f"Erro ao verificar usuário: {e}")
-        return False
-
-async def verificar_permissao_acao(interaction: discord.Interaction, tipo_acao: str) -> bool:
-    """Verifica se o usuário pode realizar a ação solicitada"""
-    try:
-        data = supabase.table('registros')\
-            .select("*")\
-            .eq('user_id', str(interaction.user.id))\
-            .order('data_hora', desc=True)\
-            .limit(1)\
-            .execute()
-
-        if not data.data:
-            if tipo_acao != 'entrada':
-                await interaction.response.send_message(
-                    "❌ Você precisa registrar uma entrada primeiro!",
-                    ephemeral=True
-                )
-                return False
-            return True
-
-        ultimo_registro = data.data[0]
-
-        if tipo_acao == 'entrada' and ultimo_registro['tipo'] != 'saida':
-            await interaction.response.send_message(
-                "❌ Você já tem um ponto aberto!",
-                ephemeral=True
-            )
-            return False
-
-        if tipo_acao == 'pausa_inicio' and ultimo_registro['tipo'] not in ['entrada', 'pausa_fim']:
-            await interaction.response.send_message(
-                "❌ Você precisa estar em expediente para iniciar uma pausa!",
-                ephemeral=True
-            )
-            return False
-
-        if tipo_acao == 'pausa_fim' and ultimo_registro['tipo'] != 'pausa_inicio':
-            await interaction.response.send_message(
-                "❌ Você precisa estar em pausa para retornar!",
-                ephemeral=True
-            )
-            return False
-
-        if tipo_acao == 'saida' and ultimo_registro['tipo'] not in ['entrada', 'pausa_fim']:
-            await interaction.response.send_message(
-                "❌ Você precisa estar em expediente para registrar saída!",
-                ephemeral=True
-            )
-            return False
-
-        return True
-
-    except Exception as e:
-        print(f"Erro ao verificar permissão: {e}")
-        await interaction.response.send_message(
-            "❌ Erro ao verificar permissão!",
-            ephemeral=True
-        )
-        return False
+        modal = RelatorioModal(self.bot)
+        await interaction.response.send_modal(modal)
 
 @bot.event
 async def on_ready():
-    print(f'Bot está online como {bot.user}')
+    print(f'Logado como {bot.user}!')
 
-@bot.command(name='ponto')
+@bot.command()
 async def ponto(ctx):
     view = PontoButtons()
-    await view.update_button_states(str(ctx.author.id))
+    message = await ctx.send("Clique nos botões para registrar seu ponto.", view=view)
+    view.message = message
 
-    embed = discord.Embed(
-        title="Sistema de Ponto",
-        description="Selecione uma opção abaixo:",
-        color=discord.Color.blue()
-    )
-    embed.set_footer(text=f"Solicitado por {ctx.author.name}")
-
-    await ctx.send(embed=embed, view=view)
-
-async def registrar_entrada_interaction(interaction: discord.Interaction):
-    if not await verificar_permissao_acao(interaction, 'entrada'):
-        return
-
-    now = datetime.datetime.now()
-
-    try:
-        data = supabase.table('registros').insert({
-            "user_id": str(interaction.user.id),
-            "user_name": interaction.user.name,
-            "tipo": "entrada",
-            "data_hora": now.isoformat(),
-        }).execute()
-
-        embed = discord.Embed(
-            title="Registro de Entrada",
-            description=f"✅ Entrada registrada às {now.strftime('%H:%M:%S')}",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    except Exception as e:
-        print(f"Erro ao registrar entrada: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar entrada!", ephemeral=True)
-
-async def registrar_pausa_inicio_interaction(interaction: discord.Interaction):
-    if not await verificar_permissao_acao(interaction, 'pausa_inicio'):
-        return
-
-    now = datetime.datetime.now()
-
-    try:
-        data = supabase.table('registros').insert({
-            "user_id": str(interaction.user.id),
-            "user_name": interaction.user.name,
-            "tipo": "pausa_inicio",
-            "data_hora": now.isoformat(),
-        }).execute()
-
-        embed = discord.Embed(
-            title="Início de Pausa",
-            description=f"⏸️ Pausa iniciada às {now.strftime('%H:%M:%S')}",
-            color=discord.Color.yellow()
-        )
-        embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    except Exception as e:
-        print(f"Erro ao registrar início de pausa: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar início de pausa!", ephemeral=True)
-
-async def registrar_pausa_fim_interaction(interaction: discord.Interaction):
-    if not await verificar_permissao_acao(interaction, 'pausa_fim'):
-        return
-
-    now = datetime.datetime.now()
-
-    try:
-        data = supabase.table('registros').insert({
-            "user_id": str(interaction.user.id),
-            "user_name": interaction.user.name,
-            "tipo": "pausa_fim",
-            "data_hora": now.isoformat(),
-        }).execute()
-
-        embed = discord.Embed(
-            title="Fim de Pausa",
-            description=f"▶️ Retorno da pausa às {now.strftime('%H:%M:%S')}",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    except Exception as e:
-        print(f"Erro ao registrar fim de pausa: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar fim de pausa!", ephemeral=True)
-
-async def registrar_saida_interaction(interaction: discord.Interaction):
-    if not await verificar_permissao_acao(interaction, 'saida'):
-        return
-
-    now = datetime.datetime.now()
-
-    try:
-        data = supabase.table('registros').insert({
-            "user_id": str(interaction.user.id),
-            "user_name": interaction.user.name,
-            "tipo": "saida",
-            "data_hora": now.isoformat(),
-        }).execute()
-
-        embed = discord.Embed(
-            title="Registro de Saída",
-            description=f"✅ Saída registrada às {now.strftime('%H:%M:%S')}",
-            color=discord.Color.red()
-        )
-        embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    except Exception as e:
-        print(f"Erro ao registrar saída: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar saída!", ephemeral=True)
-
-async def gerar_relatorio_interaction(interaction: discord.Interaction):
-    try:
-        data = supabase.table('registros')\
-            .select("*")\
-            .eq('user_id', str(interaction.user.id))\
-            .order('data_hora', desc=True)\
-            .limit(10)\
-            .execute()
-
-        if not data.data:
-            await interaction.response.send_message("❌ Não há registros de ponto!", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="Relatório de Ponto",
-            description=f"Últimos 10 registros de {interaction.user.name}",
-            color=discord.Color.blue()
-        )
-
-        for registro in data.data:
-            data_hora = datetime.datetime.fromisoformat(registro['data_hora'].replace('Z', '+00:00'))
-            tipo = registro['tipo'].replace('_', ' ').title()
-            embed.add_field(
-                name=f"{tipo} - {data_hora.strftime('%d/%m/%Y')}",
-                value=f"Horário: {data_hora.strftime('%H:%M:%S')}",
-                inline=False
-            )
-
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    except Exception as e:
-        print(f"Erro ao gerar relatório: {e}")
-        await interaction.response.send_message("❌ Erro ao gerar relatório!", ephemeral=True)
-
-bot.run('MTMwNjM0NjUxODQ5OTgyMzc0Ng.GTaPDO.kc_b7jfA4nawSPyd-wk3dLVrVX_ear8TcX7yMY')
+bot.run(DISCORD_TOKEN)
