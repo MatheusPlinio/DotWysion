@@ -127,11 +127,13 @@ class PontoButtons(discord.ui.View):
         trilha_texto = "\n".join([f"{badge}" for badge, _ in self.eventos_trilha])
 
         if self.message:
+            # Criação da embed com o avatar do usuário
             embed = discord.Embed(
                 title="Histórico de Ponto",
                 description=trilha_texto,
                 color=discord.Color.blue()
             )
+            embed.set_thumbnail(url=usuario.avatar.url + "?size=128")  # Mantém o avatar
             await self.message.edit(embed=embed, view=self)
 
     @discord.ui.button(label="Registrar Entrada", style=discord.ButtonStyle.green, custom_id="entrada")
@@ -268,9 +270,20 @@ async def ponto(ctx):
     user_id = str(ctx.author.id)
     view = PontoButtons()
 
+    embed = discord.Embed(
+        title="Escolha a opção que deseja registrar o ponto:",
+        description="Selecione a ação para registrar seu ponto.",
+        color=discord.Color.blue()
+    )
+
+    embed.set_thumbnail(url=ctx.author.avatar.url + "?size=128")
+
+    # Verifica se o usuário pode registrar ponto
     if await verificar_usuario_ponto(user_id):
-        await ctx.send("Escolha a opção que deseja registrar o ponto:", view=view)
-        view.message = await ctx.send("Escolha a opção que deseja registrar o ponto:", view=view)
+        if not view.message:  # Verifica se a mensagem ainda não foi enviada
+            view.message = await ctx.send(embed=embed, view=view)
+        else:
+            await view.message.edit(embed=embed, view=view)  # Edita a mensagem existente com a view
     else:
         await ctx.send("Você já tem um ponto registrado. Você não pode registrar outro ponto até encerrar o expediente.")
 
