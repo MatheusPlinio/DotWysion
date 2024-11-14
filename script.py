@@ -22,6 +22,20 @@ def converter_data_brasileira_para_iso8601(data_br: str) -> str:
     except ValueError:
         return None
 
+# Função para registrar o ponto no Supabase
+async def registrar_entrada(user_id: str, tipo: str, data_hora: str, user_name: str):
+    try:
+        # Inclui user_name na inserção
+        response = supabase.table('registros').insert({
+            'user_id': user_id,
+            'tipo': tipo,
+            'data_hora': data_hora,
+            'user_name': user_name
+        }).execute()
+
+    except Exception as e:
+        print(f"Erro ao registrar no Supabase: {e}")
+
 class RelatorioModal(ui.Modal, title="Gerar Relatório"):
     data_inicio = ui.TextInput(label="Data de Início (DD/MM/AAAA)", placeholder="01/01/2024")
     data_fim = ui.TextInput(label="Data de Fim (DD/MM/AAAA)", placeholder="31/12/2024")
@@ -108,12 +122,8 @@ class PontoButtons(discord.ui.View):
         self.eventos_trilha = []
         self.bot = bot
 
-    async def is_user_manager(self, interaction: discord.Interaction) -> bool:
-        member = interaction.guild.get_member(interaction.user.id)
-        return member is not None and member.guild_permissions.manage_guild
-
     async def adicionar_evento_trilha(self, evento: str, usuario: User, tipo: str):
-        timestamp = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         cor_badge = {
             'entrada': discord.Color.green(),
             'pausa_inicio': discord.Color.blurple(),
@@ -127,7 +137,6 @@ class PontoButtons(discord.ui.View):
         trilha_texto = "\n".join([f"{badge}" for badge, _ in self.eventos_trilha])
 
         if self.message:
-            # Criação da embed com o avatar do usuário
             embed = discord.Embed(
                 title="Histórico de Ponto",
                 description=trilha_texto,
@@ -135,6 +144,9 @@ class PontoButtons(discord.ui.View):
             )
             embed.set_thumbnail(url=usuario.avatar.url + "?size=128")  # Mantém o avatar
             await self.message.edit(embed=embed, view=self)
+
+        # Agora, registre o evento no Supabase, incluindo o nome do usuário
+        await registrar_entrada(str(usuario.id), tipo, timestamp, usuario.name)
 
     @discord.ui.button(label="Registrar Entrada", style=discord.ButtonStyle.green, custom_id="entrada")
     async def entrada_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -177,121 +189,22 @@ class PontoButtons(discord.ui.View):
         self.saida_button.disabled = True
         self.relatorio_button.disabled = False  # Habilita o botão de relatório
 
-        # Atualiza a view
+        # Atualiza a mensagem com a nova configuração
         await self.message.edit(view=self)
 
-    @discord.ui.button(label="Ver Relatório", style=discord.ButtonStyle.grey, custom_id="relatorio")
+    @discord.ui.button(label="Gerar Relatório", style=discord.ButtonStyle.green, custom_id="relatorio", disabled=False)
     async def relatorio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Verifica se o usuário é um administrador
-        if not await self.is_user_manager(interaction):
-            await interaction.response.send_message("❌ Você não tem permissão para gerar o relatório. Somente administradores podem fazer isso.", ephemeral=True)
-            return
-
-        # Envia o modal
-        await interaction.response.send_modal(RelatorioModal(self.bot))
-
-async def verificar_usuario_ponto(user_id: str) -> bool:
-    try:
-        data = supabase.table('registros')\
-            .select("*")\
-            .eq('user_id', user_id)\
-            .order('data_hora', desc=True)\
-            .limit(1)\
-            .execute()
-
-        if not data.data:
-            return True
-
-        ultimo_registro = data.data[0]
-        return ultimo_registro['tipo'] in ['saida', None]
-    except Exception as e:
-        print(f"Erro ao verificar usuário: {e}")
-        return False
-
-async def verificar_permissao_acao(interaction: discord.Interaction, tipo_acao: str) -> bool:
-    try:
-        data = supabase.table('registros')\
-            .select("*")\
-            .eq('user_id', str(interaction.user.id))\
-            .order('data_hora', desc=True)\
-            .limit(1)\
-            .execute()
-
-        if not data.data:
-            if tipo_acao != 'entrada':
-                await interaction.response.send_message(
-                    "❌ Você precisa registrar uma entrada primeiro!",
-                    ephemeral=True
-                )
-                return False
-            return True
-
-        ultimo_registro = data.data[0]
-
-        if tipo_acao == 'entrada' and ultimo_registro['tipo'] != 'saida':
-            await interaction.response.send_message(
-                "❌ Você já tem um ponto aberto!",
-                ephemeral=True
-            )
-            return False
-
-        if tipo_acao == 'pausa_inicio' and ultimo_registro['tipo'] not in ['entrada', 'pausa_fim']:
-            await interaction.response.send_message(
-                "❌ Você precisa estar em expediente para iniciar uma pausa.",
-                ephemeral=True
-            )
-            return False
-
-        if tipo_acao == 'pausa_fim' and ultimo_registro['tipo'] != 'pausa_inicio':
-            await interaction.response.send_message(
-                "❌ Você não pode finalizar uma pausa que não foi iniciada.",
-                ephemeral=True
-            )
-            return False
-
-        if tipo_acao == 'saida' and ultimo_registro['tipo'] != 'entrada':
-            await interaction.response.send_message(
-                "❌ Você não pode registrar a saída sem ter uma entrada.",
-                ephemeral=True
-            )
-            return False
-
-        return True
-    except Exception as e:
-        print(f"Erro ao verificar permissão: {e}")
-        return False
+        modal = RelatorioModal(self.bot)
+        await interaction.response.send_modal(modal)
 
 @bot.event
 async def on_ready():
-    print(f"Bot logged in as {bot.user}")
+    print(f'Logado como {bot.user}!')
 
 @bot.command()
 async def ponto(ctx):
-    user_id = str(ctx.author.id)
     view = PontoButtons()
-
-    embed = discord.Embed(
-        title="Escolha a opção que deseja registrar o ponto:",
-        description="Selecione a ação para registrar seu ponto.",
-        color=discord.Color.blue()
-    )
-
-    embed.set_thumbnail(url=ctx.author.avatar.url + "?size=128")
-
-    # Verifica se o usuário pode registrar ponto
-    if await verificar_usuario_ponto(user_id):
-        if not view.message:  # Verifica se a mensagem ainda não foi enviada
-            view.message = await ctx.send(embed=embed, view=view)
-        else:
-            await view.message.edit(embed=embed, view=view)  # Edita a mensagem existente com a view
-    else:
-        await ctx.send("Você já tem um ponto registrado. Você não pode registrar outro ponto até encerrar o expediente.")
-
-@bot.command()
-async def relatorio(ctx):
-    if not await verificar_permissao_acao(ctx, 'relatorio'):
-        return
-
-    await ctx.send_modal(RelatorioModal(bot))
+    message = await ctx.send("Clique nos botões para registrar seu ponto.", view=view)
+    view.message = message
 
 bot.run(DISCORD_TOKEN)
