@@ -1,3 +1,5 @@
+import io
+import os
 import discord
 from discord.ext import commands
 from discord import ui
@@ -11,23 +13,102 @@ intents = discord.Intents.all()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-"""
--- SQL para criar a tabela no Supabase:
-create table registros (
-    id bigint primary key generated always as identity,
-    user_id text not null,
-    user_name text not null,
-    tipo text not null, -- 'entrada', 'saida', 'pausa_inicio', 'pausa_fim'
-    data_hora timestamp with time zone default timezone('utc'::text, now()),
-    observacao text,
-    created_at timestamp with time zone default timezone('utc'::text, now())
-);
-"""
+def converter_data_brasileira_para_iso8601(data_br: str) -> str:
+    try:
+        # Tenta converter a string de data brasileira para um objeto datetime
+        data = datetime.datetime.strptime(data_br, "%d/%m/%Y")
+        return data.isoformat()  # Retorna a data no formato ISO 8601
+    except ValueError:
+        return None
+
+class RelatorioModal(ui.Modal, title="Gerar Relatório"):
+    data_inicio = ui.TextInput(label="Data de Início (DD/MM/AAAA)", placeholder="01/01/2024")
+    data_fim = ui.TextInput(label="Data de Fim (DD/MM/AAAA)", placeholder="31/12/2024")
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data_inicio_iso = converter_data_brasileira_para_iso8601(self.data_inicio.value)
+        data_fim_iso = converter_data_brasileira_para_iso8601(self.data_fim.value)
+
+        # Valida se as datas são válidas e se a data de início é anterior à data de fim
+        if data_inicio_iso and data_fim_iso:
+            if data_inicio_iso > data_fim_iso:
+                await interaction.response.send_message("❌ A data de início não pode ser posterior à data de fim!", ephemeral=True)
+                return
+
+            # Gerar o relatório com base nas datas informadas
+            await self.gerar_relatorio(interaction, data_inicio_iso, data_fim_iso)
+        else:
+            await interaction.response.send_message(
+                "❌ Formato de data inválido! Por favor, use DD/MM/AAAA.", ephemeral=True
+            )
+
+    async def gerar_relatorio(self, interaction: discord.Interaction, data_inicio: str, data_fim: str):
+        user_id = str(interaction.user.id)
+
+        # Filtrar registros pelo intervalo de datas
+        registros = supabase.table('registros')\
+            .select('*')\
+            .eq('user_id', user_id)\
+            .gte('data_hora', data_inicio)\
+            .lte('data_hora', data_fim)\
+            .order('data_hora', desc=True)\
+            .execute()
+
+        # Verificar se há registros
+        if not registros.data:
+            await interaction.response.send_message("❌ Não há registros para o intervalo selecionado.", ephemeral=True)
+            return
+
+        total_horas_trabalhadas = datetime.timedelta()  # Para somar as horas trabalhadas
+        total_pausa = datetime.timedelta()  # Para somar o tempo de pausa
+
+        ultima_entrada = None
+        ultima_pausa_inicio = None
+
+        for registro in registros.data:
+            tipo = registro['tipo']
+            data_hora = datetime.datetime.fromisoformat(registro['data_hora'])
+
+            if tipo == "entrada":
+                ultima_entrada = data_hora
+            elif tipo == "saida" and ultima_entrada:
+                # Se temos uma entrada e uma saída, calculamos as horas trabalhadas
+                total_horas_trabalhadas += data_hora - ultima_entrada
+                ultima_entrada = None  # Resetar entrada após a saída
+            elif tipo == "pausa_inicio":
+                ultima_pausa_inicio = data_hora
+            elif tipo == "pausa_fim" and ultima_pausa_inicio:
+                # Se temos uma pausa de início e fim, calculamos a pausa
+                total_pausa += data_hora - ultima_pausa_inicio
+                ultima_pausa_inicio = None  # Resetar pausa após a pausa_fim
+
+        # Calculando o total de horas trabalhadas excluindo pausas
+        horas_trabalhadas_excluindo_pausa = total_horas_trabalhadas - total_pausa
+
+        # Formatando as durações em formato legível
+        horas_trabalhadas_str = str(horas_trabalhadas_excluindo_pausa)
+        pausa_str = str(total_pausa)
+
+        # Montando o conteúdo do relatório
+        embed = discord.Embed(
+            title="Relatório de Horas Trabalhadas e Pausas",
+            description=f"Relatório do período de {data_inicio} a {data_fim}",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(name="Horas Trabalhadas (sem pausas)", value=horas_trabalhadas_str, inline=False)
+        embed.add_field(name="Total de Pausas", value=pausa_str, inline=False)
+
+        # Enviar o relatório para o usuário
+        await interaction.response.send_message(embed=embed)
 
 class PontoButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-
         self.entrada_button.disabled = False
         self.pausa_inicio_button.disabled = True
         self.pausa_fim_button.disabled = True
@@ -75,6 +156,11 @@ class PontoButtons(discord.ui.View):
         except Exception as e:
             print(f"Error updating button states: {e}")
 
+    @discord.ui.button(label="Ver Relatório", style=discord.ButtonStyle.grey, custom_id="relatorio")
+    async def relatorio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Gerar CSV com os registros do usuário
+        await interaction.response.send_modal(RelatorioModal(bot))
+
     @discord.ui.button(label="Registrar Entrada", style=discord.ButtonStyle.green, custom_id="entrada")
     async def entrada_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await registrar_entrada_interaction(interaction)
@@ -98,10 +184,6 @@ class PontoButtons(discord.ui.View):
         await registrar_saida_interaction(interaction)
         await self.update_button_states(str(interaction.user.id))
         await interaction.message.edit(view=self)
-
-    @discord.ui.button(label="Ver Relatório", style=discord.ButtonStyle.grey, custom_id="relatorio")
-    async def relatorio_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await gerar_relatorio_interaction(interaction)
 
 async def verificar_usuario_ponto(user_id: str) -> bool:
     """Verifica se o usuário tem um ponto aberto"""
@@ -219,14 +301,12 @@ async def registrar_entrada_interaction(interaction: discord.Interaction):
             color=discord.Color.green()
         )
         embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
+        embed.add_field(name="Data", value=now.strftime("%d/%m/%Y"))
+        embed.add_field(name="Hora", value=now.strftime("%H:%M"))
 
         await interaction.response.send_message(embed=embed)
-
     except Exception as e:
-        print(f"Erro ao registrar entrada: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar entrada!", ephemeral=True)
+        await interaction.response.send_message(f"❌ Erro ao registrar entrada: {e}", ephemeral=True)
 
 async def registrar_pausa_inicio_interaction(interaction: discord.Interaction):
     if not await verificar_permissao_acao(interaction, 'pausa_inicio'):
@@ -243,19 +323,17 @@ async def registrar_pausa_inicio_interaction(interaction: discord.Interaction):
         }).execute()
 
         embed = discord.Embed(
-            title="Início de Pausa",
-            description=f"⏸️ Pausa iniciada às {now.strftime('%H:%M:%S')}",
-            color=discord.Color.yellow()
+            title="Pausa Iniciada",
+            description=f"✅ Pausa iniciada às {now.strftime('%H:%M:%S')}",
+            color=discord.Color.orange()
         )
         embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
+        embed.add_field(name="Data", value=now.strftime("%d/%m/%Y"))
+        embed.add_field(name="Hora", value=now.strftime("%H:%M"))
 
         await interaction.response.send_message(embed=embed)
-
     except Exception as e:
-        print(f"Erro ao registrar início de pausa: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar início de pausa!", ephemeral=True)
+        await interaction.response.send_message(f"❌ Erro ao iniciar pausa: {e}", ephemeral=True)
 
 async def registrar_pausa_fim_interaction(interaction: discord.Interaction):
     if not await verificar_permissao_acao(interaction, 'pausa_fim'):
@@ -272,19 +350,17 @@ async def registrar_pausa_fim_interaction(interaction: discord.Interaction):
         }).execute()
 
         embed = discord.Embed(
-            title="Fim de Pausa",
-            description=f"▶️ Retorno da pausa às {now.strftime('%H:%M:%S')}",
+            title="Pausa Finalizada",
+            description=f"✅ Pausa finalizada às {now.strftime('%H:%M:%S')}",
             color=discord.Color.blue()
         )
         embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
+        embed.add_field(name="Data", value=now.strftime("%d/%m/%Y"))
+        embed.add_field(name="Hora", value=now.strftime("%H:%M"))
 
         await interaction.response.send_message(embed=embed)
-
     except Exception as e:
-        print(f"Erro ao registrar fim de pausa: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar fim de pausa!", ephemeral=True)
+        await interaction.response.send_message(f"❌ Erro ao finalizar pausa: {e}", ephemeral=True)
 
 async def registrar_saida_interaction(interaction: discord.Interaction):
     if not await verificar_permissao_acao(interaction, 'saida'):
@@ -306,49 +382,11 @@ async def registrar_saida_interaction(interaction: discord.Interaction):
             color=discord.Color.red()
         )
         embed.add_field(name="Funcionário", value=interaction.user.mention)
-        embed.add_field(name="Data", value=now.strftime('%d/%m/%Y'))
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
+        embed.add_field(name="Data", value=now.strftime("%d/%m/%Y"))
+        embed.add_field(name="Hora", value=now.strftime("%H:%M"))
 
         await interaction.response.send_message(embed=embed)
-
     except Exception as e:
-        print(f"Erro ao registrar saída: {e}")
-        await interaction.response.send_message("❌ Erro ao registrar saída!", ephemeral=True)
+        await interaction.response.send_message(f"❌ Erro ao registrar saída: {e}", ephemeral=True)
 
-async def gerar_relatorio_interaction(interaction: discord.Interaction):
-    try:
-        data = supabase.table('registros')\
-            .select("*")\
-            .eq('user_id', str(interaction.user.id))\
-            .order('data_hora', desc=True)\
-            .limit(10)\
-            .execute()
-
-        if not data.data:
-            await interaction.response.send_message("❌ Não há registros de ponto!", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="Relatório de Ponto",
-            description=f"Últimos 10 registros de {interaction.user.name}",
-            color=discord.Color.blue()
-        )
-
-        for registro in data.data:
-            data_hora = datetime.datetime.fromisoformat(registro['data_hora'].replace('Z', '+00:00'))
-            tipo = registro['tipo'].replace('_', ' ').title()
-            embed.add_field(
-                name=f"{tipo} - {data_hora.strftime('%d/%m/%Y')}",
-                value=f"Horário: {data_hora.strftime('%H:%M:%S')}",
-                inline=False
-            )
-
-        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
-
-        await interaction.response.send_message(embed=embed)
-
-    except Exception as e:
-        print(f"Erro ao gerar relatório: {e}")
-        await interaction.response.send_message("❌ Erro ao gerar relatório!", ephemeral=True)
-
-bot.run('MTMwNjM0NjUxODQ5OTgyMzc0Ng.GTaPDO.kc_b7jfA4nawSPyd-wk3dLVrVX_ear8TcX7yMY')
+bot.run(DISCORD_TOKEN)
